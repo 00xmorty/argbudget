@@ -1,0 +1,26 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.9', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Syntax and tests
+        run: |
+          python -m py_compile argbudget
+          python -m unittest discover -s tests -v
+      - name: Real user path
+        shell: bash
+        run: |
+          printf 'tool\000first argument\000second argument\000' | python argbudget --stdin0 --json --hide-names > smoke.json
+          python -c 'import json; x=json.load(open("smoke.json")); assert x["argument_count"] == 3; assert x["argument_bytes"] == 36; assert x["execution_guaranteed"] is False'

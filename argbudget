@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Estimate exec argument/environment byte pressure without running a command."""
+import argparse
+import json
+import os
+import re
+import struct
+import sys
+
+VERSION = "0.1.0"
+MAX_INPUT = 16 * 1024 * 1024
+
+
+def measure(env, arguments, arg_max, pointer_size):
+    """All payloads are bytes. Output never includes values or argument content."""
+    rows = []
+    for key, value in env.items():
+        name = key.decode("ascii", "replace")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", name):
+            name = "[nonstandard-name-hidden]"
+        rows.append({"name": name, "bytes": len(key) + len(value) + 2})
+    rows.sort(key=lambda row: (-row["bytes"], row["name"]))
+    env_bytes = sum(row["bytes"] for row in rows)
+    argv_bytes = sum(len(arg) + 1 for arg in arguments)
+    pointer_bytes = (len(env) + len(arguments) + 2) * pointer_size
+    estimate = env_bytes + argv_bytes + pointer_bytes
+    longest = max([row["bytes"] for row in rows] +
+                  [len(arg) + 1 for arg in arguments] + [0])
+    linux_limit = os.sysconf("SC_PAGESIZE") * 32 if sys.platform.startswith("linux") else None
+    string_risk = linux_limit is not None and longest > linux_limit
+    status = "OVER_ESTIMATE" if estimate >= arg_max or string_risk else (
+        "NEAR_LIMIT" if estimate >= arg_max * 0.8 else "BELOW_ESTIMATE")
+    return {"version": VERSION, "status": status, "arg_max_bytes": arg_max,
+            "environment_count": len(env), "environment_bytes": env_bytes,
+            "argument_count": len(arguments), "argument_bytes": argv_bytes,
+            "pointer_estimate_bytes": pointer_bytes, "estimated_total_bytes": estimate,
+            "estimated_remaining_bytes": arg_max - estimate,
+            "longest_string_bytes": longest, "linux_string_limit_bytes": linux_limit,
+            "linux_string_limit_exceeded": string_risk,
+            "largest_environment": rows[:10], "execution_guaranteed": False}
+
+
+def read_arguments(stream):
+    data = stream.read(MAX_INPUT + 1)
+    if len(data) > MAX_INPUT:
+        raise ValueError("stdin exceeds 16 MiB analysis limit")
+    if data and not data.endswith(b"\0"):
+        raise ValueError("stdin must be NUL-terminated; use printf or find -print0")
+    return data[:-1].split(b"\0") if data else []
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument("--stdin0", action="store_true",
+                        help="read complete argv, including argv[0], as NUL-terminated bytes")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--check", action="store_true", help="exit 1 for estimated pressure")
+    parser.add_argument("--hide-names", action="store_true", help="hide even environment names")
+    args = parser.parse_args(argv)
+    try:
+        arguments = read_arguments(sys.stdin.buffer) if args.stdin0 else []
+        limit = os.sysconf("SC_ARG_MAX")
+        if limit <= 0:
+            raise ValueError("ARG_MAX unavailable")
+        env = dict(os.environb) if hasattr(os, "environb") else {
+            os.fsencode(k): os.fsencode(v) for k, v in os.environ.items()}
+        report = measure(env, arguments, limit, struct.calcsize("P"))
+    except (OSError, ValueError) as exc:
+        # Never expose payloads, OS error paths, or environment values.
+        print("argbudget: input or system limit unavailable/invalid", file=sys.stderr)
+        return 2
+    if args.hide_names:
+        for row in report["largest_environment"]:
+            row["name"] = "[hidden]"
+    report["argument_input"] = "complete_argv_from_stdin" if args.stdin0 else "not_measured"
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        print("ArgBudget " + VERSION + " — " + report["status"])
+        for key in ("arg_max_bytes", "environment_bytes", "argument_bytes",
+                    "pointer_estimate_bytes", "estimated_total_bytes", "estimated_remaining_bytes"):
+            print(key + ": " + str(report[key]))
+        print("arguments: " + report["argument_input"])
+        print("Largest environment entries (name, bytes; values hidden):")
+        for row in report["largest_environment"]:
+            print("  " + row["name"] + ": " + str(row["bytes"]))
+        print("Estimate only: BELOW does not prove exec will succeed.")
+        print("Prefer stdin or bounded xargs batches; do not blindly remove environment settings.")
+    return 1 if args.check and report["status"] != "BELOW_ESTIMATE" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
